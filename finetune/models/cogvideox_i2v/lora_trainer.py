@@ -19,6 +19,150 @@ from finetune.utils import unwrap_model
 
 from ..utils import register
 
+import cv2
+import numpy as np
+import torch.nn.functional as F
+from ultralytics import YOLO
+from ..train_utils.unimatch.unimatch.unimatch import UniMatch
+from ..train_utils.unimatch.utils.flow_viz import flow_to_image
+
+
+FLOW_SCALE = 128
+PROMPT = "a realistic driving scenario with high visual quality, the overall scene is moving forward."
+
+
+palette = np.random.randint(0, 255, size=(1000, 3), dtype=np.uint8)  # For tracking IDs
+
+
+def preprocess_size(image1, image2, padding_factor=32):
+    transpose_img = False
+    # the model is trained with size: width > height
+    if image1.size(-2) > image1.size(-1):
+        image1 = torch.transpose(image1, -2, -1)
+        image2 = torch.transpose(image2, -2, -1)
+        transpose_img = True
+
+    # inference_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
+    #                 int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
+        
+    inference_size = [384, 512]
+
+    assert isinstance(inference_size, list) or isinstance(inference_size, tuple)
+    ori_size = image1.shape[-2:]
+
+    # resize before inference
+    if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+        image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
+                                align_corners=True)
+        image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
+                                align_corners=True)
+    
+    return image1, image2, inference_size, ori_size, transpose_img
+
+def postprocess_size(flow_pr, inference_size, ori_size, transpose_img):
+    if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+        flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear',
+                                align_corners=True)
+        flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / inference_size[-1]
+        flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / inference_size[-2]
+
+    if transpose_img:
+        flow_pr = torch.transpose(flow_pr, -2, -1)
+    
+    return flow_pr
+
+@torch.no_grad()
+def get_optical_flow(unimatch, video_frame):
+    '''
+        video_frame: [b, t, c, w, h]
+    '''
+    video_dtype = video_frame.dtype
+    flows = []
+    for i in range(video_frame.shape[1] - 1):
+        image1, image2 = video_frame[:, i], video_frame[:, i+1]
+
+        image1_r, image2_r, inference_size, ori_size, transpose_img = preprocess_size(image1, image2)
+        results_r = unimatch(image1_r, image2_r,
+            attn_type='swin',
+            attn_splits_list=[2, 8],
+            corr_radius_list=[-1, 4],
+            prop_radius_list=[-1, 1],
+            num_reg_refine=6,
+            task='flow',
+            pred_bidir_flow=False,
+            )['flow_preds'][-1]
+        flows.append(postprocess_size(results_r, inference_size, ori_size, transpose_img).unsqueeze(1)) 
+    
+    return torch.cat(flows, dim=1).to(video_dtype)
+
+@torch.no_grad()
+def get_seg_map(yolo_model, video_frame):
+    frame_height, frame_width = video_frame.shape[2:]
+    mask_images = []
+    mask0 = None
+    if yolo_model.predictor is not None:
+        for tracker in yolo_model.predictor.trackers:
+            tracker.reset()
+            tracker.reset_id()
+
+    # for frame_id, result in enumerate(tracking_results[:-1]):
+    for frame_id, frame in enumerate(video_frame):
+        result = yolo_model.track(
+            source=frame.permute(1, 2, 0).cpu().numpy().astype(np.uint8), 
+            persist=True, verbose=False, conf=0.2, iou=0.2, 
+            tracker="bytetrack.yaml")[0]
+        
+        # Create empty images for masks
+        mask_image = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+
+        # Extract masks and detection information
+        masks = result.masks
+        boxes = result.boxes
+        ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+
+        if masks is not None:
+            if frame_id == 0:
+                mask0 = masks.data
+
+            for i, mask in enumerate(masks.data):
+                # Convert mask to a binary mask
+                binary_mask = mask.cpu().numpy().astype(np.uint8)
+                binary_mask = cv2.resize(binary_mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+
+                track_id = int(ids[i]) if len(ids) > i else 0
+                color = palette[track_id % len(palette)].tolist()
+                colored_mask = np.zeros_like(mask_image)
+                for c in range(3):
+                    colored_mask[:, :, c] = binary_mask * color[c]
+
+                mask_image = cv2.addWeighted(mask_image, 1, colored_mask, 0.5, 0)
+
+        mask_images.append(torch.from_numpy(mask_image).permute(2, 0, 1).unsqueeze(0))
+
+    return torch.cat(mask_images, dim=0).unsqueeze(0), mask0
+
+@torch.no_grad()
+def get_seg_flow(yolo_model, unimatch, video_frames, perterb=True):
+    '''
+        Input:
+            video_frames: [b, t, c, h, w]
+        Output (fp16, cuda):
+            optical_flow: [b, t-1, 2, h, w], 
+            seg_map: [b, t-1, 3, h, w].
+    '''
+    video_frames = (video_frames + 1) * 127.5
+    flow = get_optical_flow(unimatch, video_frames)  # flow, direct_flow: [b, f-1, 2, h, w]
+    flow = torch.cat([flow, torch.zeros_like(flow[:, 0:1])], dim=1)
+
+    mask_image_batch = []
+    for b, video_frame in enumerate(video_frames):   # i: batch, j: frame
+        s_maps, _ = get_seg_map(yolo_model, video_frame)
+        mask_image_batch.append(s_maps.to(video_frames.device))       
+
+    mask_image_batch = torch.cat(mask_image_batch, dim=0).to(torch.float16)  # torch.Size([1, 24, 3, 256, 512]), [0, 1], fp16
+    
+    return flow, mask_image_batch
+
 
 class CogVideoXI2VLoraTrainer(Trainer):
     UNLOAD_LIST = ["text_encoder"]
@@ -40,6 +184,19 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
         components.scheduler = CogVideoXDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
 
+        components.flow_model = UniMatch(feature_channels=128,
+            num_scales=2,
+            upsample_factor=4,
+            num_head=1,
+            ffn_dim_expansion=4,
+            num_transformer_layers=6,
+            reg_refine=True,
+            task='flow')
+        checkpoint = torch.load('/hpc2hdd/home/txu647/code/CogVideo/finetune/models/train_utils/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth')
+        components.flow_model.load_state_dict(checkpoint['model'])
+
+        components.seg_model = YOLO('/hpc2hdd/home/txu647/code/segment-anything-2/yolo11l-seg.pt')  # Replace with your model variant if needed
+
         return components
 
     @override
@@ -55,12 +212,21 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
     @override
     def encode_video(self, video: torch.Tensor) -> torch.Tensor:
-        # shape of input video: [B, C, F, H, W]
+        # shape of input video: [B, C, F, H, W], [-1, 1]
         vae = self.components.vae
-        video = video.to(vae.device, dtype=vae.dtype)
-        latent_dist = vae.encode(video).latent_dist
-        latent = latent_dist.sample() * vae.config.scaling_factor
-        return latent
+        seg_model = self.components.seg_model
+        flow_model = self.components.flow_model
+        video = video.to(vae.device)
+        
+        flow, seg = get_seg_flow(seg_model, flow_model, video.permute(0, 2, 1, 3, 4))
+
+        seg = seg.to(vae.dtype).contiguous()
+        flow = flow.to(vae.dtype).contiguous()
+        video = video.to(vae.dtype)
+
+        latent = vae.encode(video).latent_dist.sample() * vae.config.scaling_factor
+
+        return latent, seg, flow
 
     @override
     def encode_text(self, prompt: str) -> torch.Tensor:
@@ -78,28 +244,47 @@ class CogVideoXI2VLoraTrainer(Trainer):
 
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        ret = {"encoded_videos": [], "prompt_embedding": [], "images": []}
+        ret = {"encoded_videos": [], "prompt_embedding": [], "images": [],
+               "video_seg": [], "video_flow": []}
 
         for sample in samples:
             encoded_video = sample["encoded_video"]
             prompt_embedding = sample["prompt_embedding"]
             image = sample["image"]
+            video_seg = sample["video_seg"]
+            video_flow = sample["video_flow"]
+
+            flow_images = []
+            for flow in video_flow:
+                flow_image = flow_to_image(flow.permute(1, 2, 0).float(), maxrad=FLOW_SCALE)
+                flow_images.append(torch.from_numpy(flow_image))
+            flow_images = torch.stack(flow_images).permute(3, 0, 1, 2) / 127.5 - 1.0
 
             ret["encoded_videos"].append(encoded_video)
             ret["prompt_embedding"].append(prompt_embedding)
             ret["images"].append(image)
+            ret["video_seg"].append(video_seg)
+            ret["video_flow"].append(flow_images)
 
         ret["encoded_videos"] = torch.stack(ret["encoded_videos"])
         ret["prompt_embedding"] = torch.stack(ret["prompt_embedding"])
         ret["images"] = torch.stack(ret["images"])
-
+        ret["video_seg"] = torch.stack(ret["video_seg"])
+        ret["video_flow"] = torch.stack(ret["video_flow"])
         return ret
 
     @override
     def compute_loss(self, batch) -> torch.Tensor:
+        vae = self.components.vae
+
         prompt_embedding = batch["prompt_embedding"]
         latent = batch["encoded_videos"]
         images = batch["images"]
+        video_seg = batch["video_seg"].permute(0, 2, 1, 3, 4)
+        video_flow = batch["video_flow"].to(latent.dtype)
+        
+        latent_seg = vae.encode(video_seg).latent_dist.sample() * vae.config.scaling_factor
+        latent_flow = vae.encode(video_flow).latent_dist.sample() * vae.config.scaling_factor
 
         # Shape of prompt_embedding: [B, seq_len, hidden_size]
         # Shape of latent: [B, C, F, H, W]
@@ -149,7 +334,9 @@ class CogVideoXI2VLoraTrainer(Trainer):
         latent_noisy = self.components.scheduler.add_noise(latent, noise, timesteps)
 
         # Concatenate latent and image_latents in the channel dimension
-        latent_img_noisy = torch.cat([latent_noisy, image_latents], dim=2)
+        condition_latent = torch.cat([latent_seg, latent_flow], dim=1).permute(0, 2, 1, 3, 4)
+        _latent_img_noisy = torch.cat([latent_noisy, image_latents], dim=2)
+        latent_img_noisy = torch.cat([_latent_img_noisy, condition_latent], dim=1)
 
         # Prepare rotary embeds
         vae_scale_factor_spatial = 2 ** (len(self.components.vae.config.block_out_channels) - 1)
@@ -158,7 +345,7 @@ class CogVideoXI2VLoraTrainer(Trainer):
             self.prepare_rotary_positional_embeddings(
                 height=height * vae_scale_factor_spatial,
                 width=width * vae_scale_factor_spatial,
-                num_frames=num_frames,
+                num_frames=num_frames * 2,
                 transformer_config=transformer_config,
                 vae_scale_factor_spatial=vae_scale_factor_spatial,
                 device=self.accelerator.device,
@@ -179,7 +366,8 @@ class CogVideoXI2VLoraTrainer(Trainer):
             image_rotary_emb=rotary_emb,
             return_dict=False,
         )[0]
-
+        predicted_noise = predicted_noise[:, :7]  # skip conditional latents
+        
         # Denoise
         latent_pred = self.components.scheduler.get_velocity(predicted_noise, latent_noisy, timesteps)
 
@@ -201,7 +389,16 @@ class CogVideoXI2VLoraTrainer(Trainer):
         Return the data that needs to be saved. For videos, the data format is List[PIL],
         and for images, the data format is PIL
         """
-        prompt, image, video = eval_data["prompt"], eval_data["image"], eval_data["video"]
+        vae = self.components.vae.to(self.accelerator.device)
+
+        prompt = PROMPT
+        image = eval_data["images"]
+        video_seg = eval_data["video_seg"].permute(0, 2, 1, 3, 4).to(vae.device, dtype=vae.dtype)
+        video_flow = eval_data["video_flow"].to(vae.device, dtype=vae.dtype)
+
+        latent_seg = vae.encode(video_seg).latent_dist.sample() * vae.config.scaling_factor
+        latent_flow = vae.encode(video_flow).latent_dist.sample() * vae.config.scaling_factor
+        condition_latent = torch.cat([latent_seg, latent_flow], dim=1).permute(0, 2, 1, 3, 4)
 
         video_generate = pipe(
             num_frames=self.state.train_frames,
@@ -209,7 +406,9 @@ class CogVideoXI2VLoraTrainer(Trainer):
             width=self.state.train_width,
             prompt=prompt,
             image=image,
+            condition_latent=condition_latent,
             generator=self.state.generator,
+            num_inference_steps=25,  # tianshuo
         ).frames[0]
         return [("video", video_generate)]
 

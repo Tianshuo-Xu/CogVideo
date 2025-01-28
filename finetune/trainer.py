@@ -49,7 +49,7 @@ from finetune.utils import (
     unwrap_model,
 )
 
-
+PROMPT = "a realistic driving scenario with high visual quality, the overall scene is moving forward."
 logger = get_logger(LOG_NAME, LOG_LEVEL)
 
 _DTYPE_MAP = {
@@ -89,7 +89,7 @@ class Trainer:
     def _init_distributed(self):
         logging_dir = Path(self.args.output_dir, "logs")
         project_config = ProjectConfiguration(project_dir=self.args.output_dir, logging_dir=logging_dir)
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
         init_process_group_kwargs = InitProcessGroupKwargs(
             backend="nccl", timeout=timedelta(seconds=self.args.nccl_timeout)
         )
@@ -156,6 +156,20 @@ class Trainer:
 
         self.state.transformer_config = self.components.transformer.config
 
+    def create_iterator(self, sample_size, sample_dataset):
+        while True:
+            sample_loader = torch.utils.data.DataLoader(
+                dataset=sample_dataset,
+                batch_size=sample_size,
+                collate_fn=self.collate_fn,
+                num_workers=0,
+                shuffle=True,
+                drop_last=True
+            )
+
+            for item in sample_loader:
+                yield item
+
     def prepare_dataset(self) -> None:
         logger.info("Initializing dataset and dataloader")
 
@@ -168,6 +182,16 @@ class Trainer:
                 width=self.state.train_width,
                 trainer=self,
             )
+            test_dataset = I2VDatasetWithResize(
+                **(self.args.model_dump()),
+                device=self.accelerator.device,
+                max_num_frames=self.state.train_frames,
+                height=self.state.train_height,
+                width=self.state.train_width,
+                trainer=self,
+            )
+            self.test_loader = self.create_iterator(1, test_dataset)
+
         elif self.args.model_type == "t2v":
             self.dataset = T2VDatasetWithResize(
                 **(self.args.model_dump()),
@@ -182,25 +206,31 @@ class Trainer:
 
         # Prepare VAE and text encoder for encoding
         self.components.vae.requires_grad_(False)
+        self.components.flow_model.eval()
+        self.components.flow_model.requires_grad_(False)
         self.components.text_encoder.requires_grad_(False)
         self.components.vae = self.components.vae.to(self.accelerator.device, dtype=self.state.weight_dtype)
         self.components.text_encoder = self.components.text_encoder.to(
             self.accelerator.device, dtype=self.state.weight_dtype
         )
+        self.components.seg_model = self.components.seg_model.to(self.accelerator.device)
+        self.components.flow_model = self.components.flow_model.to(self.accelerator.device)
 
         # Precompute latent for video and prompt embedding
         logger.info("Precomputing latent for video and prompt embedding ...")
-        tmp_data_loader = torch.utils.data.DataLoader(
-            self.dataset,
-            collate_fn=self.collate_fn,
-            batch_size=1,
-            num_workers=0,
-            pin_memory=self.args.pin_memory,
-        )
-        tmp_data_loader = self.accelerator.prepare_data_loader(tmp_data_loader)
-        for _ in tmp_data_loader:
-            ...
-        self.accelerator.wait_for_everyone()
+        # tmp_data_loader = torch.utils.data.DataLoader(
+        #     self.dataset,
+        #     batch_size=1,
+        #     num_workers=0,
+        #     shuffle=True,
+        #     pin_memory=self.args.pin_memory,
+        # )
+        # tmp_data_loader = self.accelerator.prepare_data_loader(tmp_data_loader)
+        # for step, _ in enumerate(tmp_data_loader):
+        #     if step % 100 == 0:
+        #         print("step:", step)
+        #     ...
+        # self.accelerator.wait_for_everyone()
         logger.info("Precomputing latent for video and prompt embedding ... Done")
 
         unload_model(self.components.vae)
@@ -335,21 +365,22 @@ class Trainer:
         self.state.num_update_steps_per_epoch = num_update_steps_per_epoch
 
     def prepare_for_validation(self):
-        validation_prompts = load_prompts(self.args.validation_dir / self.args.validation_prompts)
+        pass
+        # validation_prompts = load_prompts(self.args.validation_dir / self.args.validation_prompts)
 
-        if self.args.validation_images is not None:
-            validation_images = load_images(self.args.validation_dir / self.args.validation_images)
-        else:
-            validation_images = [None] * len(validation_prompts)
+        # if self.args.validation_images is not None:
+        #     validation_images = load_images(self.args.validation_dir / self.args.validation_images)
+        # else:
+        #     validation_images = [None] * len(validation_prompts)
 
-        if self.args.validation_videos is not None:
-            validation_videos = load_videos(self.args.validation_dir / self.args.validation_videos)
-        else:
-            validation_videos = [None] * len(validation_prompts)
+        # if self.args.validation_videos is not None:
+        #     validation_videos = load_videos(self.args.validation_dir / self.args.validation_videos)
+        # else:
+        #     validation_videos = [None] * len(validation_prompts)
 
-        self.state.validation_prompts = validation_prompts
-        self.state.validation_images = validation_images
-        self.state.validation_videos = validation_videos
+        # self.state.validation_prompts = validation_prompts
+        # self.state.validation_images = validation_images
+        # self.state.validation_videos = validation_videos
 
     def prepare_trackers(self) -> None:
         logger.info("Initializing trackers")
@@ -485,7 +516,7 @@ class Trainer:
         logger.info("Starting validation")
 
         accelerator = self.accelerator
-        num_validation_samples = len(self.state.validation_prompts)
+        num_validation_samples = 4
 
         if num_validation_samples == 0:
             logger.warning("No validation samples found. Skipping validation.")
@@ -522,31 +553,9 @@ class Trainer:
                 # Skip current validation on all processes but one
                 if i % accelerator.num_processes != accelerator.process_index:
                     continue
-
-            prompt = self.state.validation_prompts[i]
-            image = self.state.validation_images[i]
-            video = self.state.validation_videos[i]
-
-            if image is not None:
-                image = preprocess_image_with_resize(image, self.state.train_height, self.state.train_width)
-                # Convert image tensor (C, H, W) to PIL images
-                image = image.to(torch.uint8)
-                image = image.permute(1, 2, 0).cpu().numpy()
-                image = Image.fromarray(image)
-
-            if video is not None:
-                video = preprocess_video_with_resize(
-                    video, self.state.train_frames, self.state.train_height, self.state.train_width
-                )
-                # Convert video tensor (F, C, H, W) to list of PIL images
-                video = video.round().clamp(0, 255).to(torch.uint8)
-                video = [Image.fromarray(frame.permute(1, 2, 0).cpu().numpy()) for frame in video]
-
-            logger.debug(
-                f"Validating sample {i + 1}/{num_validation_samples} on process {accelerator.process_index}. Prompt: {prompt}",
-                main_process_only=False,
-            )
-            validation_artifacts = self.validation_step({"prompt": prompt, "image": image, "video": video}, pipe)
+            
+            val_batch = next(self.test_loader)
+            validation_artifacts = self.validation_step(val_batch, pipe)
 
             if (
                 self.state.using_deepspeed
@@ -555,15 +564,9 @@ class Trainer:
             ):
                 continue
 
-            prompt_filename = string_to_filename(prompt)[:25]
-            # Calculate hash of reversed prompt as a unique identifier
-            reversed_prompt = prompt[::-1]
-            hash_suffix = hashlib.md5(reversed_prompt.encode()).hexdigest()[:5]
-
-            artifacts = {
-                "image": {"type": "image", "value": image},
-                "video": {"type": "video", "value": video},
-            }
+            video = None
+            artifacts = {"video": {"type": "video", "value": video}}
+            
             for i, (artifact_type, artifact_value) in enumerate(validation_artifacts):
                 artifacts.update({f"artifact_{i}": {"type": artifact_type, "value": artifact_value}})
             logger.debug(
@@ -578,19 +581,15 @@ class Trainer:
                     continue
 
                 extension = "png" if artifact_type == "image" else "mp4"
-                filename = f"validation-{step}-{accelerator.process_index}-{prompt_filename}-{hash_suffix}.{extension}"
+                filename = f"validation-{step}-{accelerator.process_index}-{i}.{extension}"
                 validation_path = self.args.output_dir / "validation_res"
                 validation_path.mkdir(parents=True, exist_ok=True)
                 filename = str(validation_path / filename)
 
-                if artifact_type == "image":
-                    logger.debug(f"Saving image to {filename}")
-                    artifact_value.save(filename)
-                    artifact_value = wandb.Image(filename)
-                elif artifact_type == "video":
+                if artifact_type == "video":
                     logger.debug(f"Saving video to {filename}")
                     export_to_video(artifact_value, filename, fps=self.args.gen_fps)
-                    artifact_value = wandb.Video(filename, caption=prompt)
+                    artifact_value = wandb.Video(filename, caption=PROMPT)
 
                 all_processes_artifacts.append(artifact_value)
 

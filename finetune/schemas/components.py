@@ -26,3 +26,7 @@ class Components(BaseModel):
 
     # Scheduler
     scheduler: Any = None
+
+    # Other model, tianshuo
+    seg_model: Any = None
+    flow_model: Any = None

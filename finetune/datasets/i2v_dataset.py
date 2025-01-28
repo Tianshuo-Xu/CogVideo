@@ -1,6 +1,9 @@
 import hashlib
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+import random
+from copy import deepcopy
 
 import torch
 from accelerate.logging import get_logger
@@ -8,8 +11,15 @@ from safetensors.torch import load_file, save_file
 from torch.utils.data import Dataset
 from torchvision import transforms
 from typing_extensions import override
-
+import pandas as pd
 from finetune.constants import LOG_LEVEL, LOG_NAME
+from decord import VideoReader, cpu
+import numpy as np 
+from PIL import Image
+from ..models.train_utils.degradation import degrade_image
+from ..models.train_utils.unimatch.utils.flow_viz import flow_to_image
+
+import albumentations as A
 
 from .utils import (
     load_images,
@@ -21,6 +31,9 @@ from .utils import (
     preprocess_video_with_resize,
 )
 
+FLOW_SCALE = 128
+
+PROMPT = "a realistic driving scenario with high visual quality, the overall scene is moving forward."
 
 if TYPE_CHECKING:
     from finetune.trainer import Trainer
@@ -32,6 +45,32 @@ import decord  # isort:skip
 decord.bridge.set_bridge("torch")
 
 logger = get_logger(LOG_NAME, LOG_LEVEL)
+
+import torch.distributed as dist
+
+shape_transform = A.Compose([
+    A.ElasticTransform(
+        alpha=10, sigma=10, 
+        alpha_affine=5, p = 1.0
+        )
+])
+
+def perturbation(video_input):
+    device, dtype = video_input.device, video_input.dtype
+    t = video_input.shape[0]
+    video_input = video_input.float().cpu().numpy().astype(np.uint8)
+    transformed_video = np.zeros_like(video_input)
+
+    for j in range(t):
+        frame = video_input[j].transpose(1, 2, 0)
+        transformed_frame = shape_transform(image=frame)["image"]
+        transformed_video[j] = transformed_frame.transpose(2, 0, 1)
+
+    return torch.from_numpy(transformed_video).to(device=device, dtype=dtype)
+
+
+def zero_rank_print(s):
+    if (not dist.is_initialized()) and (dist.is_initialized() and dist.get_rank() == 0): print("### " + s)
 
 
 class BaseI2VDataset(Dataset):
@@ -63,8 +102,8 @@ class BaseI2VDataset(Dataset):
         super().__init__()
 
         data_root = Path(data_root)
-        self.prompts = load_prompts(data_root / caption_column)
-        self.videos = load_videos(data_root / video_column)
+        # self.prompts = load_prompts(data_root / caption_column)
+        self.videos = load_videos(video_column)
         if image_column is not None:
             self.images = load_images(data_root / image_column)
         else:
@@ -76,10 +115,10 @@ class BaseI2VDataset(Dataset):
         self.encode_text = trainer.encode_text
 
         # Check if number of prompts matches number of videos and images
-        if not (len(self.videos) == len(self.prompts) == len(self.images)):
-            raise ValueError(
-                f"Expected length of prompts, videos and images to be the same but found {len(self.prompts)=}, {len(self.videos)=} and {len(self.images)=}. Please ensure that the number of caption prompts, videos and images match in your dataset."
-            )
+        # if not (len(self.videos) == len(self.prompts) == len(self.images)):
+        #     raise ValueError(
+        #         f"Expected length of prompts, videos and images to be the same but found {len(self.prompts)=}, {len(self.videos)=} and {len(self.images)=}. Please ensure that the number of caption prompts, videos and images match in your dataset."
+        #     )
 
         # Check if all video files exist
         if any(not path.is_file() for path in self.videos):
@@ -109,7 +148,8 @@ class BaseI2VDataset(Dataset):
             # that data is not loaded a second time. PRs are welcome for improvements.
             return index
 
-        prompt = self.prompts[index]
+        # prompt = self.prompts[index]
+        prompt = PROMPT
         video = self.videos[index]
         image = self.images[index]
         train_resolution_str = "x".join(str(x) for x in self.trainer.args.train_resolution)
@@ -120,7 +160,8 @@ class BaseI2VDataset(Dataset):
         video_latent_dir.mkdir(parents=True, exist_ok=True)
         prompt_embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-        prompt_hash = str(hashlib.sha256(prompt.encode()).hexdigest())
+        # prompt_hash = str(hashlib.sha256(prompt.encode()).hexdigest())  # tianshuo
+        prompt_hash = "prompt"
         prompt_embedding_path = prompt_embeddings_dir / (prompt_hash + ".safetensors")
         encoded_video_path = video_latent_dir / (video.stem + ".safetensors")
 
@@ -139,13 +180,18 @@ class BaseI2VDataset(Dataset):
             logger.info(f"Saved prompt embedding to {prompt_embedding_path}", main_process_only=False)
 
         if encoded_video_path.exists():
-            encoded_video = load_file(encoded_video_path)["encoded_video"]
+            loaded_file = load_file(encoded_video_path)
+
+            encoded_video = loaded_file["encoded_video"]
+            video_seg = loaded_file["video_seg"]
+            video_flow = loaded_file["video_flow"]
+            
             logger.debug(f"Loaded encoded video from {encoded_video_path}", main_process_only=False)
             # shape of image: [C, H, W]
             _, image = self.preprocess(None, self.images[index])
             image = self.image_transform(image)
         else:
-            frames, image = self.preprocess(video, image)
+            frames, image = self.preprocess(video, image)  # video is a path here
             frames = frames.to(self.device)
             image = image.to(self.device)
             image = self.image_transform(image)
@@ -155,21 +201,35 @@ class BaseI2VDataset(Dataset):
             # Convert to [B, C, F, H, W]
             frames = frames.unsqueeze(0)
             frames = frames.permute(0, 2, 1, 3, 4).contiguous()
-            encoded_video = self.encode_video(frames)
-
+            encoded_video, video_seg, video_flow = self.encode_video(frames)
+            
             # [1, C, F, H, W] -> [C, F, H, W]
             encoded_video = encoded_video[0]
             encoded_video = encoded_video.to("cpu")
             image = image.to("cpu")
-            save_file({"encoded_video": encoded_video}, encoded_video_path)
+            video_seg = video_seg[0].to("cpu")
+            video_flow = video_flow[0].to("cpu")
+
+            save_file({
+                "encoded_video": encoded_video,
+                "video_seg": video_seg,
+                "video_flow": video_flow
+                }, encoded_video_path)
             logger.info(f"Saved encoded video to {encoded_video_path}", main_process_only=False)
 
         # shape of encoded_video: [C, F, H, W]
         # shape of image: [C, H, W]
+
+        # perturbation
+        video_seg = perturbation(video_seg) / 127.5 - 1.0
+        video_flow = degrade_image(video_flow, scale_factor=16, noise_type='gaussian', noise_std=1)
+
         return {
             "image": image,
             "prompt_embedding": prompt_embedding,
             "encoded_video": encoded_video,
+            "video_seg": video_seg,
+            "video_flow": video_flow,
             "video_metadata": {
                 "num_frames": encoded_video.shape[1],
                 "height": encoded_video.shape[2],

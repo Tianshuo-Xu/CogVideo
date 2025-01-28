@@ -5,25 +5,25 @@ export TOKENIZERS_PARALLELISM=false
 
 # Model Configuration
 MODEL_ARGS=(
-    --model_path "THUDM/CogVideoX1.5-5B-I2V"
-    --model_name "cogvideox1.5-i2v"  # ["cogvideox-i2v"]
+    --model_path "THUDM/CogVideoX-5b-I2V"
+    --model_name "cogvideox-i2v"  # ["cogvideox-i2v"]
     --model_type "i2v"
     --training_type "lora"
 )
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/path/to/your/output_dir"
+    --output_dir "debug"
     --report_to "tensorboard"
 )
 
 # Data Configuration
 DATA_ARGS=(
-    --data_root "/absolute/path/to/your/data_root"
-    --caption_column "prompt.txt"
-    --video_column "videos.txt"
+    --data_root "/hpc2hdd/home/txu647/code/video_data/clips"
+    --caption_column "not_important"
+    --video_column "valid_videos.txt"
     # --image_column "images.txt"  # comment this line will use first frame of video as image conditioning
-    --train_resolution "81x768x1360"  # (frames x height x width), frames should be 8N+1
+    --train_resolution "25x480x720"  # (frames x height x width), frames should be 8N+1
 )
 
 # Training Configuration
@@ -44,19 +44,19 @@ SYSTEM_ARGS=(
 
 # Checkpointing Configuration
 CHECKPOINT_ARGS=(
-    --checkpointing_steps 10 # save checkpoint every x steps
-    --checkpointing_limit 2 # maximum number of checkpoints to keep, after which the oldest one is deleted
-    --resume_from_checkpoint "/absolute/path/to/checkpoint_dir"  # if you want to resume from a checkpoint, otherwise, comment this line
+    --checkpointing_steps 1000 # save checkpoint every x steps
+    --checkpointing_limit 20 # maximum number of checkpoints to keep, after which the oldest one is deleted
+    # --resume_from_checkpoint "/absolute/path/to/checkpoint_dir"  # if you want to resume from a checkpoint, otherwise, comment this line
 )
 
 # Validation Configuration
 VALIDATION_ARGS=(
-    --do_validation false  # ["true", "false"]
-    --validation_dir "/absolute/path/to/your/validation_set"
-    --validation_steps 20  # should be multiple of checkpointing_steps
+    --do_validation true  # ["true", "false"]
+    --validation_dir "NotImportant"
+    --validation_steps 1000  # should be multiple of checkpointing_steps
     --validation_prompts "prompts.txt"
     --validation_images "images.txt"
-    --gen_fps 16
+    --gen_fps 8
 )
 
 # Combine all arguments and launch training
@@ -68,3 +68,6 @@ accelerate launch train.py \
     "${SYSTEM_ARGS[@]}" \
     "${CHECKPOINT_ARGS[@]}" \
     "${VALIDATION_ARGS[@]}"
+
+# --config_file 0.yaml
+# bash train_ddp_i2v.sh
